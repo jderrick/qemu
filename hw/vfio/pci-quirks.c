@@ -1603,6 +1603,107 @@ out:
     g_free(lpc);
 }
 
+typedef struct VFIOVMDQuirk {
+    VFIOConfigMirrorQuirk *mirror;
+} VFIOVMDQuirk;
+
+static uint64_t vfio_vmd_quirk_mirror_read(void *opaque,
+                                           hwaddr addr, unsigned size)
+{
+    VFIOVMDQuirk *quirk = opaque;
+    VFIOConfigMirrorQuirk *mirror = quirk->mirror;
+    VFIOPCIDevice *vdev = mirror->vdev;
+    uint64_t data, new_data;
+
+    /* Read and discard in case the hardware cares */
+    (void)vfio_region_read(&vdev->bars[mirror->bar].region,
+                           addr + mirror->offset, size);
+
+    data = new_data = vfio_region_read(&vdev->bars[mirror->bar].region,
+                                       addr + mirror->offset, size);
+    /* Change root port and device Memory Base HPA to GPA */
+    if (addr == 0x20 || addr == 0x8020 || addr == 0x10020 || addr == 0x18020) {
+        if ((data & 0xFF00FF00) == 0x9E009E00) {
+            new_data = 0xF600F600 | (data & 0x00FF00FF);
+        }
+    } else if ((addr > 0x20000) && ((addr & 0xFFFFF) == 0x10)) {
+        if ((data & 0xFF000000) == 0x9E000000) {
+            new_data = 0xF6000000 | (data & 0x00FFFFFF);
+        }
+    }
+
+    trace_vfio_quirk_vmd_mirror_read(vdev->vbasedev.name,
+                                     memory_region_name(mirror->mem),
+                                     addr + mirror->offset, data, new_data);
+    return new_data;
+}
+
+static void vfio_vmd_quirk_mirror_write(void *opaque, hwaddr addr,
+                                        uint64_t data, unsigned size)
+{
+    VFIOVMDQuirk *quirk = opaque;
+    VFIOConfigMirrorQuirk *mirror = quirk->mirror;
+    VFIOPCIDevice *vdev = mirror->vdev;
+    uint64_t new_data = data;
+
+    /* Change root port and device Memory Base GPA to HPA */
+    if (addr == 0x20 || addr == 0x8020 || addr == 0x10020 || addr == 0x18020) {
+        if ((data & 0xFF00FF00) == 0xF600F600) {
+            new_data = 0x9E009E00 | (data & 0x00FF00FF);
+        }
+    } else if ((addr > 0x20000) && ((addr & 0xFFFFF) == 0x10)) {
+        if ((data & 0xFF000000) == 0xF6000000) {
+            new_data = 0x9E000000 | (data & 0x00FFFFFF);
+        }
+    }
+
+    vfio_region_write(&vdev->bars[mirror->bar].region,
+                      addr + mirror->offset, new_data, size);
+
+    trace_vfio_quirk_vmd_mirror_write(vdev->vbasedev.name,
+                                      memory_region_name(mirror->mem),
+                                      addr + mirror->offset, data, new_data);
+}
+
+static const MemoryRegionOps vfio_vmd_mirror_quirk = {
+    .read = vfio_vmd_quirk_mirror_read,
+    .write = vfio_vmd_quirk_mirror_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void vfio_probe_vmd_bar0_quirk(VFIOPCIDevice *vdev, int nr)
+{
+    VFIOQuirk *quirk;
+    VFIOConfigMirrorQuirk *mirror;
+    VFIOVMDQuirk *data;
+
+    if (!vfio_pci_is(vdev, PCI_VENDOR_ID_INTEL, 0x201d) || nr != 0) {
+        return;
+    }
+
+    quirk = g_malloc0(sizeof(*quirk));
+    quirk->nr_mem = 1;
+    quirk->data = data = g_malloc0(sizeof(*data));
+    mirror = g_malloc0(sizeof(*mirror));
+    mirror->mem = quirk->mem = g_new0(MemoryRegion, 1);
+    mirror->vdev = vdev;
+    mirror->offset = 0;
+    mirror->bar = nr;
+    data->mirror = mirror;
+
+    memory_region_init_io(mirror->mem, OBJECT(vdev),
+                          &vfio_vmd_mirror_quirk, data,
+                          "vfio-vmd-bar0-mirror-quirk",
+                          vdev->bars[nr].region.size);
+    memory_region_add_subregion_overlap(vdev->bars[nr].region.mem,
+                                        mirror->offset,
+                                        mirror->mem, 1);
+
+    QLIST_INSERT_HEAD(&vdev->bars[nr].quirks, quirk, next);
+
+    trace_vfio_quirk_vmd_bar0_probe(vdev->vbasedev.name);
+}
+
 /*
  * Common quirk probe entry points.
  */
@@ -1653,6 +1754,7 @@ void vfio_bar_quirk_setup(VFIOPCIDevice *vdev, int nr)
     vfio_probe_nvidia_bar0_quirk(vdev, nr);
     vfio_probe_rtl8168_bar2_quirk(vdev, nr);
     vfio_probe_igd_bar4_quirk(vdev, nr);
+    vfio_probe_vmd_bar0_quirk(vdev, nr);
 }
 
 void vfio_bar_quirk_exit(VFIOPCIDevice *vdev, int nr)
